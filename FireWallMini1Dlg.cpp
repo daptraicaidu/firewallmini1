@@ -8,9 +8,74 @@
 #include "FireWallMini1Dlg.h"
 #include "afxdialogex.h"
 
+#include <pcap.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <vector>
+#include <string>
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
+
+// Định nghĩa Custom Message để Thread bắt gói gửi log về UI Thread
+#define WM_UPDATE_LOG (WM_USER + 100)
+
+// Cấu trúc Ethernet Header (14 bytes)
+#pragma pack(push, 1)
+struct EthernetHeader {
+	unsigned char dest[6];
+	unsigned char source[6];
+	unsigned short type; // Protocol type (IP, ARP, etc.)
+};
+
+// Cấu trúc IP Header (Cơ bản cho IPv4)
+struct IpHeader {
+	unsigned char  ver_ihl;        // Version (4 bits) + Internet Header Length (4 bits)
+	unsigned char  tos;            // Type of service 
+	unsigned short tlen;           // Total length 
+	unsigned short identification; // Identification
+	unsigned short flags_fo;       // Flags (3 bits) + Fragment Offset (13 bits)
+	unsigned char  ttl;            // Time to live
+	unsigned char  proto;          // Protocol
+	unsigned short crc;            // Header checksum
+	unsigned char  saddr[4];       // Source address
+	unsigned char  daddr[4];       // Destination address
+};
+
+// Cấu trúc TCP Header
+struct TcpHeader {
+	unsigned short sport; // Source port
+	unsigned short dport; // Destination port
+	unsigned int   seq;   // Sequence number
+	unsigned int   ack;   // Acknowledgement number
+	unsigned char  offset_res;  // Data offset + Reserved
+	unsigned char  flags;       // Flags
+	unsigned short win;         // Window size
+	unsigned short sum;         // Checksum
+	unsigned short urp;         // Urgent pointer
+};
+
+// Cấu trúc UDP Header
+struct UdpHeader {
+	unsigned short sport; // Source port
+	unsigned short dport; // Destination port
+	unsigned short len;   // Datagram length
+	unsigned short crc;   // Checksum
+};
+#pragma pack(pop)
+
+// Struct dùng để gửi dữ liệu từ Thread về UI
+struct LogData {
+	CString time;
+	CString protocol;
+	CString srcIP;
+	CString srcPort;
+	CString dstIP;
+	CString dstPort;
+	CString matchedRule;
+};
 
 
 // CAboutDlg dialog used for App About
@@ -52,6 +117,15 @@ END_MESSAGE_MAP()
 
 CFireWallMini1Dlg::CFireWallMini1Dlg(CWnd* pParent /*=nullptr*/)
 	: CDialogEx(IDD_FIREWALLMINI1_DIALOG, pParent)
+	// --- KHỞI TẠO GIÁ TRỊ MẶC ĐỊNH (Initializer List) ---
+	, m_adhandle(nullptr)
+	, m_isCapturing(false)
+	, m_pCaptureThread(nullptr)
+	, m_cntTotal(0)
+	, m_cntTcp(0)
+	, m_cntUdp(0)
+	, m_cntIcmp(0)
+	// ----------------------------------------------------
 {
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 }
@@ -78,6 +152,10 @@ BEGIN_MESSAGE_MAP(CFireWallMini1Dlg, CDialogEx)
 	ON_WM_QUERYDRAGICON()
 	ON_BN_CLICKED(IDC_BTN_START, &CFireWallMini1Dlg::OnBnClickedBtnStart)
 	ON_BN_CLICKED(IDC_BTN_STOP, &CFireWallMini1Dlg::OnBnClickedBtnStop)
+	ON_BN_CLICKED(IDC_BTN_CLEAR, &CFireWallMini1Dlg::OnBnClickedBtnClear)
+
+	ON_MESSAGE(WM_UPDATE_LOG, &CFireWallMini1Dlg::OnUpdateLog)
+	
 END_MESSAGE_MAP()
 
 
@@ -115,16 +193,46 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 	// TODO: Add extra initialization here
 	// 
 	
-	// Cấu hình ComboBox Adapter
+	// Khởi tạo biến đếm
+	m_cntTotal = m_cntTcp = m_cntUdp = m_cntIcmp = 0;
+	m_isCapturing = false;
+	m_adhandle = nullptr;
+
+	// Lấy danh sách Adapter bằng Npcap
+	pcap_if_t* alldevs;
+	pcap_if_t* d;
+	char errbuf[PCAP_ERRBUF_SIZE];
+
+	// Xóa dữ liệu cũ trong ComboBox
+	m_cbAdapter.ResetContent();
 	m_cbAdapter.AddString(_T("-- Chọn adapter --"));
-	m_cbAdapter.AddString(_T("Demo: Npcap Loopback"));
+	m_adapterNames.clear();
+	m_adapterNames.push_back(""); // Dummy cho index 0
+
+	if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+		MessageBox(_T("Lỗi tìm adapter: ") + CString(errbuf));
+	}
+	else {
+		for (d = alldevs; d; d = d->next) {
+			CString strDesc;
+			if (d->description)
+				strDesc = CString(d->description);
+			else
+				strDesc = CString(d->name);
+
+			m_cbAdapter.AddString(strDesc);
+			m_adapterNames.push_back(d->name); // Lưu tên hệ thống để dùng khi open
+		}
+		pcap_freealldevs(alldevs);
+	}
 	m_cbAdapter.SetCurSel(0);
 
 	// Hiển thị danh sách Rule đang kích hoạt
-	CString strRulesContent = _T("Danh sách Rule kích hoạt:\n")
+	CString strRulesContent = 
+		_T("Danh sách Rule kích hoạt:\n")
 		_T("-----------------------------\n")
 		_T("Rule 1: Log mọi gói UDP\n")
-		_T("Rule 2: Log mọi TCP đến port 80\n")
+		_T("Rule 2: Log mọi gói TCP\n")
 		_T("Rule 3: Log gói từ IP 192.168.1.10");
 
 	m_staticRules.SetWindowText(strRulesContent);
@@ -197,34 +305,208 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 {
 	// Kiểm tra đã chọn adapter mạng chưa
 	int nIndex = m_cbAdapter.GetCurSel();
-	// Nếu chưa chọn gì (CB_ERR) hoặc chọn dòng đầu tiên ("-- Chọn adapter --")
-	if (nIndex == CB_ERR || nIndex == 0)
-	{
-		MessageBox(_T("Vui lòng chọn một Adapter mạng để bắt đầu!"),
-			_T("Lỗi"),
-			MB_OK | MB_ICONWARNING);
-		return; // Thoát hàm ngay, không chạy tiếp
+	if (nIndex <= 0 || nIndex >= m_adapterNames.size()) {
+		MessageBox(_T("Vui lòng chọn Adapter!"), _T("Lỗi"), MB_ICONWARNING);
+		return;
 	}
 
+	// Lấy tên adapter thực (ví dụ: \Device\NPF_{...})
+	std::string adapterName = m_adapterNames[nIndex];
+	char errbuf[PCAP_ERRBUF_SIZE];
 
-	m_btnStart.SetWindowText(_T("Running"));
+	// 1. Mở Adapter (Promiscuous mode, timeout 1000ms)
+		// [cite: 19, 78] Sử dụng pcap_open_live
+	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 1, 1000, errbuf);
+
+	if (m_adhandle == nullptr) {
+		MessageBox(_T("Không thể mở adapter. Hãy chạy với quyền Admin!"), _T("Lỗi"), MB_ICONERROR);
+		return;
+	}
+
+	// 2. Cập nhật UI
+	m_isCapturing = true;
 	m_btnStart.EnableWindow(FALSE);
-
-	m_btnStop.SetWindowText(_T("Stop Capture"));
 	m_btnStop.EnableWindow(TRUE);
+	m_cbAdapter.EnableWindow(FALSE);
+	m_btnStart.SetWindowText(_T("Running..."));
 
-
-	// TODO: Add your control notification handler code here
+	// 3. Khởi chạy Worker Thread
+	// [cite: 24, 38] Thread B chạy pcap_loop
+	m_pCaptureThread = AfxBeginThread(CaptureThreadFunc, this);
 }
+
 
 void CFireWallMini1Dlg::OnBnClickedBtnStop()
 {
-	m_btnStart.SetWindowText(_T("Start Capture"));
-	m_btnStart.EnableWindow(TRUE);
+	if (m_isCapturing) {
+		m_isCapturing = false;
 
-	m_btnStop.SetWindowText(_T("Stopped"));
-	m_btnStop.EnableWindow(FALSE);
+		// Dừng pcap_loop
+		if (m_adhandle) {
+			pcap_breakloop(m_adhandle);
+			pcap_close(m_adhandle);
+			m_adhandle = nullptr;
+		}
+
+		// Chờ thread kết thúc (tùy chọn)
+		// WaitForSingleObject(m_pCaptureThread->m_hThread, INFINITE);
+
+		m_btnStart.EnableWindow(TRUE);
+		m_btnStart.SetWindowText(_T("Start Capture"));
+		m_btnStop.EnableWindow(FALSE);
+		m_btnStop.SetWindowText(_T("Stopped"));
+		m_cbAdapter.EnableWindow(TRUE);
+	}
+}
+
+void CFireWallMini1Dlg::OnBnClickedBtnClear()
+{
+	m_listLog.DeleteAllItems();
+	m_cntTotal = m_cntTcp = m_cntUdp = m_cntIcmp = 0;
+
+	m_strTotal.SetWindowText(_T("0"));
+	m_strTcp.SetWindowText(_T("0"));
+	m_strUdp.SetWindowText(_T("0"));
+	m_strIcmp.SetWindowText(_T("0"));
+	m_strRowCount.SetWindowText(_T("0 rows"));
+}
 
 
-	// TODO: Add your control notification handler code here
+
+// Worker Thread function
+UINT CFireWallMini1Dlg::CaptureThreadFunc(LPVOID pParam)
+{
+	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)pParam;
+
+	if (pDlg->m_adhandle) {
+		// Bắt gói và gọi PacketHandler cho mỗi gói
+		// Bắt gói liên tục bằng pcap_loop
+		pcap_loop(pDlg->m_adhandle, 0, PacketHandler, (u_char*)pDlg);
+	}
+	return 0;
+}
+
+// Hàm xử lý mỗi gói bắt được
+void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* header, const u_char* pkt_data)
+{
+	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)param;
+	if (!pDlg->m_isCapturing) return;
+
+	// Loại bỏ Ethernet header (14 bytes)
+	IpHeader* ipHeader = (IpHeader*)(pkt_data + 14);
+
+	// Parse IP Addresses
+	struct in_addr source, dest;
+	memcpy(&source, ipHeader->saddr, 4);
+	memcpy(&dest, ipHeader->daddr, 4);
+
+	char strSrcBuffer[INET_ADDRSTRLEN];
+	char strDstBuffer[INET_ADDRSTRLEN];
+
+	// Chuyển đổi IP nguồn, đích
+	inet_ntop(AF_INET, &source, strSrcBuffer, INET_ADDRSTRLEN);
+	inet_ntop(AF_INET, &dest, strDstBuffer, INET_ADDRSTRLEN);
+
+	CString srcIP(strSrcBuffer);
+	CString dstIP(strDstBuffer);
+
+	int protocol = ipHeader->proto;
+	int srcPort = 0, dstPort = 0;
+	CString strProtocol = _T("OTHER");
+
+	// Đọc protocol và port
+	if (protocol == IPPROTO_TCP) {
+		strProtocol = _T("TCP");
+		TcpHeader* tcpHeader = (TcpHeader*)(pkt_data + 14 + (ipHeader->ver_ihl & 0x0F) * 4);
+		srcPort = ntohs(tcpHeader->sport);
+		dstPort = ntohs(tcpHeader->dport);
+	}
+	else if (protocol == IPPROTO_UDP) {
+		strProtocol = _T("UDP");
+		UdpHeader* udpHeader = (UdpHeader*)(pkt_data + 14 + (ipHeader->ver_ihl & 0x0F) * 4);
+		srcPort = ntohs(udpHeader->sport);
+		dstPort = ntohs(udpHeader->dport);
+	}
+	else if (protocol == IPPROTO_ICMP) {
+		strProtocol = _T("ICMP");
+	}
+
+
+	CString matchedRule = _T("");
+	bool isMatch = false;
+
+	if (strProtocol == _T("UDP")) {
+		matchedRule = _T("Rule 1 (All UDP)");
+		isMatch = true;
+	}
+	else if (strProtocol == _T("TCP")) {
+		matchedRule = _T("Rule 2 (All TCP)");
+		isMatch = true;
+	}
+	else if (srcIP == _T("192.168.1.23")) {
+		matchedRule = _T("Rule 3 (Src IP Match)");
+		isMatch = true;
+	}
+
+	// Nếu match rule thì gửi về UI để log 
+	if (isMatch) {
+		LogData* pLog = new LogData;
+
+		// Format thời gian
+		time_t local_tv_sec = header->ts.tv_sec;
+		struct tm ltime;
+		localtime_s(&ltime, &local_tv_sec);
+		char timestr[16];
+		strftime(timestr, sizeof timestr, "%H:%M:%S", &ltime);
+
+		pLog->time = CString(timestr);
+		pLog->protocol = strProtocol;
+		pLog->srcIP = srcIP;
+		pLog->srcPort.Format(_T("%d"), srcPort);
+		pLog->dstIP = dstIP;
+		pLog->dstPort.Format(_T("%d"), dstPort);
+		pLog->matchedRule = matchedRule;
+
+		pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
+	}
+
+
+}
+
+
+LRESULT CFireWallMini1Dlg::OnUpdateLog(WPARAM wParam, LPARAM lParam)
+{
+	LogData* pLog = (LogData*)wParam;
+	if (pLog) {
+		// 1. Insert Log vào List Control
+		int nIndex = m_listLog.GetItemCount();
+		m_listLog.InsertItem(nIndex, pLog->time);
+		m_listLog.SetItemText(nIndex, 1, pLog->protocol);
+		m_listLog.SetItemText(nIndex, 2, pLog->srcIP);
+		m_listLog.SetItemText(nIndex, 3, pLog->srcPort);
+		m_listLog.SetItemText(nIndex, 4, pLog->dstIP);
+		m_listLog.SetItemText(nIndex, 5, pLog->dstPort);
+		m_listLog.SetItemText(nIndex, 6, pLog->matchedRule);
+
+		// Auto scroll xuống dưới cùng
+		m_listLog.EnsureVisible(nIndex, FALSE);
+
+		// 2. Cập nhật Counters [cite: 71, 73]
+		m_cntTotal++;
+		if (pLog->protocol == _T("TCP")) m_cntTcp++;
+		else if (pLog->protocol == _T("UDP")) m_cntUdp++;
+		else if (pLog->protocol == _T("ICMP")) m_cntIcmp++;
+
+		CString strTmp;
+		strTmp.Format(_T("%ld"), m_cntTotal); m_strTotal.SetWindowText(strTmp);
+		strTmp.Format(_T("%ld"), m_cntTcp);   m_strTcp.SetWindowText(strTmp);
+		strTmp.Format(_T("%ld"), m_cntUdp);   m_strUdp.SetWindowText(strTmp);
+		strTmp.Format(_T("%ld"), m_cntIcmp);  m_strIcmp.SetWindowText(strTmp);
+
+		strTmp.Format(_T("%d rows"), nIndex + 1); m_strRowCount.SetWindowText(strTmp);
+
+		// Giải phóng bộ nhớ
+		delete pLog;
+	}
+	return 0;
 }
