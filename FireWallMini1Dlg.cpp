@@ -7,6 +7,7 @@
 #include "FireWallMini1.h"
 #include "FireWallMini1Dlg.h"
 #include "afxdialogex.h"
+#include "DebugLog.h"
 
 #include <pcap.h>
 #include <winsock2.h>
@@ -14,6 +15,8 @@
 #include <iphlpapi.h>
 #include <vector>
 #include <string>
+
+
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -312,16 +315,24 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 
 	// Lấy tên adapter thực (ví dụ: \Device\NPF_{...})
 	std::string adapterName = m_adapterNames[nIndex];
+
+	CString wName(adapterName.c_str());
+	DEBUG_LOG(L"[START] Trying to open adapter: %s", (LPCTSTR)wName);
+
 	char errbuf[PCAP_ERRBUF_SIZE];
 
 	// 1. Mở Adapter (Promiscuous mode, timeout 1000ms)
-		// [cite: 19, 78] Sử dụng pcap_open_live
+		// Sử dụng pcap_open_live
 	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 1, 1000, errbuf);
 
 	if (m_adhandle == nullptr) {
+		DEBUG_LOG(L"[ERROR] pcap_open_live failed: %S", errbuf);
 		MessageBox(_T("Không thể mở adapter. Hãy chạy với quyền Admin!"), _T("Lỗi"), MB_ICONERROR);
 		return;
 	}
+
+	int linkType = pcap_datalink(m_adhandle);
+	DEBUG_LOG(L"[INFO] Adapter Opened. LinkType (DLT): %d", linkType);
 
 	// 2. Cập nhật UI
 	m_isCapturing = true;
@@ -331,7 +342,7 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 	m_btnStart.SetWindowText(_T("Running..."));
 
 	// 3. Khởi chạy Worker Thread
-	// [cite: 24, 38] Thread B chạy pcap_loop
+	DEBUG_LOG(L"[INFO] Starting Capture Thread...");
 	m_pCaptureThread = AfxBeginThread(CaptureThreadFunc, this);
 }
 
@@ -368,7 +379,7 @@ void CFireWallMini1Dlg::OnBnClickedBtnClear()
 	m_strTcp.SetWindowText(_T("0"));
 	m_strUdp.SetWindowText(_T("0"));
 	m_strIcmp.SetWindowText(_T("0"));
-	m_strRowCount.SetWindowText(_T("0 rows"));
+	m_strRowCount.SetWindowText(_T("0"));
 }
 
 
@@ -391,6 +402,8 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 {
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)param;
 	if (!pDlg->m_isCapturing) return;
+
+	DEBUG_LOG(L"[PACKET] Captured a packet. Len: %d", header->len);
 
 	// Loại bỏ Ethernet header (14 bytes)
 	IpHeader* ipHeader = (IpHeader*)(pkt_data + 14);
@@ -431,6 +444,8 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		strProtocol = _T("ICMP");
 	}
 
+	// Log thông tin gói
+	DEBUG_LOG(L"[PARSE] Proto: %d, Src: %s", protocol, (LPCTSTR)srcIP);
 
 	CString matchedRule = _T("");
 	bool isMatch = false;
@@ -447,9 +462,14 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		matchedRule = _T("Rule 3 (Src IP Match)");
 		isMatch = true;
 	}
+	else {
+		// Nếu gói tin không khớp rule nào, log ra để biết ta đang bỏ lỡ cái gì
+		DEBUG_LOG(L"[DROP] Dropped Packet - Proto: %s | Src: %s", (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+	}
 
 	// Nếu match rule thì gửi về UI để log 
 	if (isMatch) {
+		DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol);
 		LogData* pLog = new LogData;
 
 		// Format thời gian
