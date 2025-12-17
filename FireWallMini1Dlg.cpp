@@ -131,13 +131,14 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 
 	// Cấu hình List Control
 	m_listLog.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-	m_listLog.InsertColumn(0, _T("Time"), LVCFMT_LEFT, 100);
+	m_listLog.InsertColumn(0, _T("Time"), LVCFMT_LEFT, 140);
 	m_listLog.InsertColumn(1, _T("Protocol"), LVCFMT_LEFT, 60);
-	m_listLog.InsertColumn(2, _T("Src IP"), LVCFMT_LEFT, 120);
+	m_listLog.InsertColumn(2, _T("Src IP"), LVCFMT_LEFT, 100);
 	m_listLog.InsertColumn(3, _T("Src Port"), LVCFMT_LEFT, 60);
-	m_listLog.InsertColumn(4, _T("Dst IP"), LVCFMT_LEFT, 120);
+	m_listLog.InsertColumn(4, _T("Dst IP"), LVCFMT_LEFT, 100);
 	m_listLog.InsertColumn(5, _T("Dst Port"), LVCFMT_LEFT, 60);
 	m_listLog.InsertColumn(6, _T("Matched Rule"), LVCFMT_LEFT, 150);
+
 
 	return TRUE;  // return TRUE  unless you set the focus to a control
 }
