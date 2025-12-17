@@ -495,12 +495,8 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		matchedRule = _T("Rule 2 (All TCP)");
 		isMatch = true;
 	}
-	else if (strProtocol == _T("ICMP")) { // <--- Đã thêm ICMP
-		matchedRule = _T("Rule 4 (ICMP - Ping)");
-		isMatch = true;
-	}
-	else if (srcIP == _T("192.168.1.23")) {
-		matchedRule = _T("Rule 3 (Src IP Match)");
+	else if (strProtocol == _T("ICMP")) {
+		matchedRule = _T("Rule 3 (ICMP - Ping)");
 		isMatch = true;
 	}
 
