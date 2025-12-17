@@ -52,6 +52,8 @@ protected:
 	long m_cntUdp;
 	long m_cntIcmp;
 
+	long m_debugPacketCount;
+
 	// Hàm Worker Thread (static để chạy độc lập)
 	static UINT CaptureThreadFunc(LPVOID pParam);
 

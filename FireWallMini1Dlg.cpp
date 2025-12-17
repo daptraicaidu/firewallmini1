@@ -128,6 +128,7 @@ CFireWallMini1Dlg::CFireWallMini1Dlg(CWnd* pParent /*=nullptr*/)
 	, m_cntTcp(0)
 	, m_cntUdp(0)
 	, m_cntIcmp(0)
+	, m_debugPacketCount(0)
 	// ----------------------------------------------------
 {
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
@@ -232,7 +233,6 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 
 	// Hiển thị danh sách Rule đang kích hoạt
 	CString strRulesContent = 
-		_T("Danh sách Rule kích hoạt:\n")
 		_T("Ghi hard code sau\n")
 		/*_T("Rule 1: Log mọi gói UDP\n")
 		_T("Rule 2: Log mọi gói TCP\n")
@@ -243,7 +243,7 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 
 	// Cấu hình List Control
 	m_listLog.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-	m_listLog.InsertColumn(0, _T("Time"), LVCFMT_LEFT, 140);
+	m_listLog.InsertColumn(0, _T("Time"), LVCFMT_LEFT, 90);
 	m_listLog.InsertColumn(1, _T("Protocol"), LVCFMT_LEFT, 60);
 	m_listLog.InsertColumn(2, _T("Src IP"), LVCFMT_LEFT, 100);
 	m_listLog.InsertColumn(3, _T("Src Port"), LVCFMT_LEFT, 60);
@@ -333,8 +333,13 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 	}
 
 	int linkType = pcap_datalink(m_adhandle);
-	DEBUG_LOG(L"[INFO] Adapter Opened. LinkType (DLT): %d", linkType);
+	if (linkType != 1) {
+		CString strWarn;
+		strWarn.Format(_T("Cảnh báo: Adapter này có LinkType = %d (không phải Ethernet chuẩn 1).\nViệc phân tích header (offset 14) có thể bị sai!"), linkType);
+		MessageBox(strWarn, _T("Cảnh báo"), MB_ICONWARNING);
+	}
 
+	m_debugPacketCount = 0; // Reset biến đếm gói debug
 	// 2. Cập nhật UI
 	m_isCapturing = true;
 	m_btnStart.EnableWindow(FALSE);
@@ -425,21 +430,32 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)param;
 	if (!pDlg->m_isCapturing) return;
 
-	// --- CƠ CHẾ LOG AN TOÀN (SAFE LOGGING) ---
-	// Biến tĩnh đếm số gói đã nhận
-	static int debugPacketCount = 0;
-	// Chỉ log chi tiết 50 gói đầu tiên để debug, sau đó im lặng để tránh treo
-	bool shouldLog = (debugPacketCount < 50);
+	// --- SỬA LẠI PHẦN LOGGING ---
+	// Tăng biến đếm thành viên (đã được reset khi bấm Start)
+	pDlg->m_debugPacketCount++;
+
+	// Chỉ log 50 gói đầu tiên của phiên chạy hiện tại
+	bool shouldLog = (pDlg->m_debugPacketCount < 50);
 
 	if (shouldLog) {
-		debugPacketCount++;
-		DEBUG_LOG(L"[PACKET #%d] Captured Len: %d", debugPacketCount, header->len);
+		DEBUG_LOG(L"[PACKET #%d] Captured Len: %d", pDlg->m_debugPacketCount, header->len);
 	}
-	// -----------------------------------------
+	// ----------------------------
+
+	// --- KIỂM TRA ĐỘ DÀI GÓI TIN ---
+	// Tránh đọc quá vùng nhớ nếu gói tin quá ngắn
+	if (header->len < 14) return; // Không đủ header Ethernet
 
 	// 1. Parse Ethernet Header (14 bytes)
-	// Lưu ý: Đảm bảo LinkType là 1 (Ethernet). Nếu là Wifi Raw sẽ sai offset.
 	IpHeader* ipHeader = (IpHeader*)(pkt_data + 14);
+
+	// Kiểm tra version IP (Chỉ xử lý IPv4 - 4 bits đầu tiên là 4)
+	// ipHeader->ver_ihl là 1 byte: VVVV IIII. Lấy 4 bit đầu.
+	int version = (ipHeader->ver_ihl >> 4);
+	if (version != 4) {
+		// Nếu không phải IPv4, bỏ qua để tránh rác
+		return;
+	}
 
 	// 2. Parse IP Addresses
 	struct in_addr source, dest;
@@ -478,10 +494,6 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		strProtocol = _T("ICMP");
 	}
 
-	// Log thông tin đã parse (chỉ hiện 50 gói đầu)
-	if (shouldLog) {
-		DEBUG_LOG(L"[PARSE #%d] Proto: %d (%s) | Src: %s", debugPacketCount, protocol, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
-	}
 
 	// 4. Match Rule
 	CString matchedRule = _T("");
@@ -524,12 +536,7 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 
 		pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
 	}
-	else {
-		// Nếu không khớp rule nào, log lý do DROP (chỉ hiện 50 gói đầu)
-		if (shouldLog) {
-			DEBUG_LOG(L"[DROP #%d] Dropped Packet - Proto: %s | Src: %s", debugPacketCount, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
-		}
-	}
+
 }
 
 
