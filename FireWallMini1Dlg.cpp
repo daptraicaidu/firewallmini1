@@ -233,10 +233,11 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 	// Hiển thị danh sách Rule đang kích hoạt
 	CString strRulesContent = 
 		_T("Danh sách Rule kích hoạt:\n")
-		_T("-----------------------------\n")
-		_T("Rule 1: Log mọi gói UDP\n")
+		_T("Ghi hard code sau\n")
+		/*_T("Rule 1: Log mọi gói UDP\n")
 		_T("Rule 2: Log mọi gói TCP\n")
-		_T("Rule 3: Log gói từ IP 192.168.1.10");
+		_T("Rule 3: Log gói từ IP 192.168.1.10")*/
+		;
 
 	m_staticRules.SetWindowText(strRulesContent);
 
@@ -323,7 +324,7 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 
 	// 1. Mở Adapter (Promiscuous mode, timeout 1000ms)
 		// Sử dụng pcap_open_live
-	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 1, 1000, errbuf);
+	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 0, 10, errbuf);
 
 	if (m_adhandle == nullptr) {
 		DEBUG_LOG(L"[ERROR] pcap_open_live failed: %S", errbuf);
@@ -349,19 +350,27 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 
 void CFireWallMini1Dlg::OnBnClickedBtnStop()
 {
+	// Chỉ xử lý nếu đang capture
 	if (m_isCapturing) {
-		m_isCapturing = false;
+		m_isCapturing = false; // Đặt cờ này trước để PacketHandler ngừng xử lý ngay lập tức
 
-		// Dừng pcap_loop
 		if (m_adhandle) {
+			// Log để debug xem quy trình stop có chạy không
+			DEBUG_LOG(L"[STOP] Stopping capture...");
+
+			// pcap_breakloop an toàn hơn khi gọi từ thread khác, 
+			// nhưng nếu loop đã chết (do lỗi -1) thì dòng này có thể thừa nhưng không sao.
 			pcap_breakloop(m_adhandle);
+
+			// Đợi một chút để Thread kịp thoát (hack nhỏ để tránh race condition)
+			Sleep(100);
+
 			pcap_close(m_adhandle);
 			m_adhandle = nullptr;
+			DEBUG_LOG(L"[STOP] Adapter closed.");
 		}
 
-		// Chờ thread kết thúc (tùy chọn)
-		// WaitForSingleObject(m_pCaptureThread->m_hThread, INFINITE);
-
+		// Reset giao diện
 		m_btnStart.EnableWindow(TRUE);
 		m_btnStart.SetWindowText(_T("Start Capture"));
 		m_btnStop.EnableWindow(FALSE);
@@ -389,11 +398,24 @@ UINT CFireWallMini1Dlg::CaptureThreadFunc(LPVOID pParam)
 {
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)pParam;
 
+	DEBUG_LOG(L"[THREAD] Capture Thread Started. Handle: %p", pDlg->m_adhandle);
+
 	if (pDlg->m_adhandle) {
-		// Bắt gói và gọi PacketHandler cho mỗi gói
-		// Bắt gói liên tục bằng pcap_loop
-		pcap_loop(pDlg->m_adhandle, 0, PacketHandler, (u_char*)pDlg);
+		// pcap_loop trả về: 0 (hết gói), -1 (lỗi), -2 (breakloop)
+		int ret = pcap_loop(pDlg->m_adhandle, 0, PacketHandler, (u_char*)pDlg);
+
+		DEBUG_LOG(L"[THREAD] pcap_loop finished. Return Code: %d", ret);
+
+		if (ret == -1) {
+			// Nếu lỗi, in chi tiết lỗi từ driver
+			DEBUG_LOG(L"[THREAD] Error Detail: %S", pcap_geterr(pDlg->m_adhandle));
+		}
 	}
+	else {
+		DEBUG_LOG(L"[THREAD] Error: Handle is NULL");
+	}
+
+	DEBUG_LOG(L"[THREAD] Capture Thread Exiting...");
 	return 0;
 }
 
@@ -403,20 +425,29 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)param;
 	if (!pDlg->m_isCapturing) return;
 
-	DEBUG_LOG(L"[PACKET] Captured a packet. Len: %d", header->len);
+	// --- CƠ CHẾ LOG AN TOÀN (SAFE LOGGING) ---
+	// Biến tĩnh đếm số gói đã nhận
+	static int debugPacketCount = 0;
+	// Chỉ log chi tiết 50 gói đầu tiên để debug, sau đó im lặng để tránh treo
+	bool shouldLog = (debugPacketCount < 50);
 
-	// Loại bỏ Ethernet header (14 bytes)
+	if (shouldLog) {
+		debugPacketCount++;
+		DEBUG_LOG(L"[PACKET #%d] Captured Len: %d", debugPacketCount, header->len);
+	}
+	// -----------------------------------------
+
+	// 1. Parse Ethernet Header (14 bytes)
+	// Lưu ý: Đảm bảo LinkType là 1 (Ethernet). Nếu là Wifi Raw sẽ sai offset.
 	IpHeader* ipHeader = (IpHeader*)(pkt_data + 14);
 
-	// Parse IP Addresses
+	// 2. Parse IP Addresses
 	struct in_addr source, dest;
 	memcpy(&source, ipHeader->saddr, 4);
 	memcpy(&dest, ipHeader->daddr, 4);
 
 	char strSrcBuffer[INET_ADDRSTRLEN];
 	char strDstBuffer[INET_ADDRSTRLEN];
-
-	// Chuyển đổi IP nguồn, đích
 	inet_ntop(AF_INET, &source, strSrcBuffer, INET_ADDRSTRLEN);
 	inet_ntop(AF_INET, &dest, strDstBuffer, INET_ADDRSTRLEN);
 
@@ -427,16 +458,19 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 	int srcPort = 0, dstPort = 0;
 	CString strProtocol = _T("OTHER");
 
-	// Đọc protocol và port
+	// 3. Parse Protocol
 	if (protocol == IPPROTO_TCP) {
 		strProtocol = _T("TCP");
-		TcpHeader* tcpHeader = (TcpHeader*)(pkt_data + 14 + (ipHeader->ver_ihl & 0x0F) * 4);
+		// Tính toán offset header IP thực tế (vì IHL có thể > 5)
+		int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
+		TcpHeader* tcpHeader = (TcpHeader*)(pkt_data + 14 + ipHeaderLen);
 		srcPort = ntohs(tcpHeader->sport);
 		dstPort = ntohs(tcpHeader->dport);
 	}
 	else if (protocol == IPPROTO_UDP) {
 		strProtocol = _T("UDP");
-		UdpHeader* udpHeader = (UdpHeader*)(pkt_data + 14 + (ipHeader->ver_ihl & 0x0F) * 4);
+		int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
+		UdpHeader* udpHeader = (UdpHeader*)(pkt_data + 14 + ipHeaderLen);
 		srcPort = ntohs(udpHeader->sport);
 		dstPort = ntohs(udpHeader->dport);
 	}
@@ -444,9 +478,12 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		strProtocol = _T("ICMP");
 	}
 
-	// Log thông tin gói
-	DEBUG_LOG(L"[PARSE] Proto: %d, Src: %s", protocol, (LPCTSTR)srcIP);
+	// Log thông tin đã parse (chỉ hiện 50 gói đầu)
+	if (shouldLog) {
+		DEBUG_LOG(L"[PARSE #%d] Proto: %d (%s) | Src: %s", debugPacketCount, protocol, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+	}
 
+	// 4. Match Rule
 	CString matchedRule = _T("");
 	bool isMatch = false;
 
@@ -458,21 +495,23 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		matchedRule = _T("Rule 2 (All TCP)");
 		isMatch = true;
 	}
+	else if (strProtocol == _T("ICMP")) { // <--- Đã thêm ICMP
+		matchedRule = _T("Rule 4 (ICMP - Ping)");
+		isMatch = true;
+	}
 	else if (srcIP == _T("192.168.1.23")) {
 		matchedRule = _T("Rule 3 (Src IP Match)");
 		isMatch = true;
 	}
-	else {
-		// Nếu gói tin không khớp rule nào, log ra để biết ta đang bỏ lỡ cái gì
-		DEBUG_LOG(L"[DROP] Dropped Packet - Proto: %s | Src: %s", (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
-	}
 
-	// Nếu match rule thì gửi về UI để log 
+	// 5. Gửi về UI hoặc Log Drop
 	if (isMatch) {
-		DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol);
+		// Log MATCH luôn được hiện (vì số lượng ít hơn nhiều so với RAW)
+		DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s | Src: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+
 		LogData* pLog = new LogData;
 
-		// Format thời gian
+		// Format Time
 		time_t local_tv_sec = header->ts.tv_sec;
 		struct tm ltime;
 		localtime_s(&ltime, &local_tv_sec);
@@ -489,8 +528,12 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 
 		pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
 	}
-
-
+	else {
+		// Nếu không khớp rule nào, log lý do DROP (chỉ hiện 50 gói đầu)
+		if (shouldLog) {
+			DEBUG_LOG(L"[DROP #%d] Dropped Packet - Proto: %s | Src: %s", debugPacketCount, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+		}
+	}
 }
 
 
