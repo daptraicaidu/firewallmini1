@@ -77,9 +77,18 @@ struct LogData {
 	CString srcPort;
 	CString dstIP;
 	CString dstPort;
+	CString size;
+	CString info;
 	CString matchedRule;
 };
 
+struct IcmpHeader {
+	unsigned char type; // 8=Request, 0=Reply
+	unsigned char code;
+	unsigned short checksum;
+	unsigned short id;
+	unsigned short seq;
+};
 
 // CAboutDlg dialog used for App About
 
@@ -128,7 +137,7 @@ CFireWallMini1Dlg::CFireWallMini1Dlg(CWnd* pParent /*=nullptr*/)
 	, m_cntTcp(0)
 	, m_cntUdp(0)
 	, m_cntIcmp(0)
-	, m_debugPacketCount(0)
+	, m_linkHeaderLen(0)
 	// ----------------------------------------------------
 {
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
@@ -159,6 +168,7 @@ BEGIN_MESSAGE_MAP(CFireWallMini1Dlg, CDialogEx)
 	ON_BN_CLICKED(IDC_BTN_CLEAR, &CFireWallMini1Dlg::OnBnClickedBtnClear)
 
 	ON_MESSAGE(WM_UPDATE_LOG, &CFireWallMini1Dlg::OnUpdateLog)
+	ON_NOTIFY(NM_CUSTOMDRAW, IDC_LIST_LOG, &CFireWallMini1Dlg::OnCustomDrawList)
 	
 END_MESSAGE_MAP()
 
@@ -233,23 +243,25 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 
 	// Hiển thị danh sách Rule đang kích hoạt
 	CString strRulesContent = 
-		_T("Ghi hard code sau\n")
-		/*_T("Rule 1: Log mọi gói UDP\n")
-		_T("Rule 2: Log mọi gói TCP\n")
-		_T("Rule 3: Log gói từ IP 192.168.1.10")*/
+		_T("Rule 1: Log mọi gói TCP\n")
+		_T("Rule 2: Log mọi gói UDP\n")
+		_T("Rule 3: Log mọi gói ICMP")
 		;
 
 	m_staticRules.SetWindowText(strRulesContent);
 
 	// Cấu hình List Control
 	m_listLog.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-	m_listLog.InsertColumn(0, _T("Time"), LVCFMT_LEFT, 90);
-	m_listLog.InsertColumn(1, _T("Protocol"), LVCFMT_LEFT, 60);
-	m_listLog.InsertColumn(2, _T("Src IP"), LVCFMT_LEFT, 100);
-	m_listLog.InsertColumn(3, _T("Src Port"), LVCFMT_LEFT, 60);
-	m_listLog.InsertColumn(4, _T("Dst IP"), LVCFMT_LEFT, 100);
-	m_listLog.InsertColumn(5, _T("Dst Port"), LVCFMT_LEFT, 60);
-	m_listLog.InsertColumn(6, _T("Matched Rule"), LVCFMT_LEFT, 150);
+	m_listLog.InsertColumn(0, _T("No."), LVCFMT_LEFT, 50);
+	m_listLog.InsertColumn(1, _T("Time"), LVCFMT_LEFT, 90);
+	m_listLog.InsertColumn(2, _T("Protocol"), LVCFMT_LEFT, 60);
+	m_listLog.InsertColumn(3, _T("Src IP"), LVCFMT_LEFT, 110);
+	m_listLog.InsertColumn(4, _T("Src Port"), LVCFMT_LEFT, 60);
+	m_listLog.InsertColumn(5, _T("Dst IP"), LVCFMT_LEFT, 110);
+	m_listLog.InsertColumn(6, _T("Dst Port"), LVCFMT_LEFT, 60);
+	m_listLog.InsertColumn(7, _T("Size"), LVCFMT_LEFT, 60);
+	m_listLog.InsertColumn(8, _T("Info"), LVCFMT_LEFT, 200);
+	m_listLog.InsertColumn(9, _T("Matched Rule"), LVCFMT_LEFT, 90);
 
 
 	return TRUE;  // return TRUE  unless you set the focus to a control
@@ -316,15 +328,18 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 
 	// Lấy tên adapter thực (ví dụ: \Device\NPF_{...})
 	std::string adapterName = m_adapterNames[nIndex];
-
 	CString wName(adapterName.c_str());
+
+	CString strFriendlyName;
+	m_cbAdapter.GetLBText(nIndex, strFriendlyName);
+	DEBUG_LOG(L"[CHECK] Ban chon: %s", (LPCTSTR)strFriendlyName);
 	DEBUG_LOG(L"[START] Trying to open adapter: %s", (LPCTSTR)wName);
 
 	char errbuf[PCAP_ERRBUF_SIZE];
 
 	// 1. Mở Adapter (Promiscuous mode, timeout 1000ms)
 		// Sử dụng pcap_open_live
-	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 0, 10, errbuf);
+	m_adhandle = pcap_open_live(adapterName.c_str(), 65536, 1, 1000, errbuf);
 
 	if (m_adhandle == nullptr) {
 		DEBUG_LOG(L"[ERROR] pcap_open_live failed: %S", errbuf);
@@ -333,13 +348,24 @@ void CFireWallMini1Dlg::OnBnClickedBtnStart()
 	}
 
 	int linkType = pcap_datalink(m_adhandle);
-	if (linkType != 1) {
+	if (linkType == 1) {
+		// DLT_EN10MB: Ethernet chuẩn (Card Intel, Wi-Fi, Dây)
+		m_linkHeaderLen = 14;
+		DEBUG_LOG(L"[INFO] Phat hien Ethernet Link. Offset = 14");
+	}
+	else if (linkType == 0) {
+		// DLT_NULL: Loopback (Localhost)
+		m_linkHeaderLen = 4;
+		DEBUG_LOG(L"[INFO] Phat hien Loopback Link. Offset = 4");
+	}
+	else {
+		// Trường hợp lạ khác
 		CString strWarn;
-		strWarn.Format(_T("Cảnh báo: Adapter này có LinkType = %d (không phải Ethernet chuẩn 1).\nViệc phân tích header (offset 14) có thể bị sai!"), linkType);
-		MessageBox(strWarn, _T("Cảnh báo"), MB_ICONWARNING);
+		strWarn.Format(_T("LinkType la %d (khong phai 1 hoac 0). Chuong trinh co the chay sai!"), linkType);
+		MessageBox(strWarn, _T("Canh bao"), MB_ICONWARNING);
+		m_linkHeaderLen = 14;
 	}
 
-	m_debugPacketCount = 0; // Reset biến đếm gói debug
 	// 2. Cập nhật UI
 	m_isCapturing = true;
 	m_btnStart.EnableWindow(FALSE);
@@ -403,24 +429,40 @@ UINT CFireWallMini1Dlg::CaptureThreadFunc(LPVOID pParam)
 {
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)pParam;
 
-	DEBUG_LOG(L"[THREAD] Capture Thread Started. Handle: %p", pDlg->m_adhandle);
+	DEBUG_LOG(L"[THREAD] Thread bat dau chay voi che do: pcap_next_ex (Polling)");
 
-	if (pDlg->m_adhandle) {
-		// pcap_loop trả về: 0 (hết gói), -1 (lỗi), -2 (breakloop)
-		int ret = pcap_loop(pDlg->m_adhandle, 0, PacketHandler, (u_char*)pDlg);
+	if (!pDlg->m_adhandle) {
+		DEBUG_LOG(L"[ERROR] Handle bi NULL, thread thoat!");
+		return 0;
+	}
 
-		DEBUG_LOG(L"[THREAD] pcap_loop finished. Return Code: %d", ret);
+	struct pcap_pkthdr* header;
+	const u_char* pkt_data;
+	int res;
 
-		if (ret == -1) {
-			// Nếu lỗi, in chi tiết lỗi từ driver
-			DEBUG_LOG(L"[THREAD] Error Detail: %S", pcap_geterr(pDlg->m_adhandle));
+	while (pDlg->m_isCapturing) {
+
+		res = pcap_next_ex(pDlg->m_adhandle, &header, &pkt_data);
+
+		if (res == 1) {
+			// DEBUG_LOG(L"[RAW] Got packet len: %d", header->len); //spam logs
+			PacketHandler((u_char*)pDlg, header, pkt_data);
+		}
+		else if (res == 0) {
+			 DEBUG_LOG(L"[WAIT] Dang cho goi tin..."); 
+			continue;
+		}
+		else if (res == -1) {
+			DEBUG_LOG(L"[ERROR] Loi pcap_next_ex: %S", pcap_geterr(pDlg->m_adhandle));
+			break; 
+		}
+		else if (res == -2) {
+			DEBUG_LOG(L"[INFO] Adapter bao EOF");
+			break;
 		}
 	}
-	else {
-		DEBUG_LOG(L"[THREAD] Error: Handle is NULL");
-	}
 
-	DEBUG_LOG(L"[THREAD] Capture Thread Exiting...");
+	DEBUG_LOG(L"[THREAD] Thread ket thuc.");
 	return 0;
 }
 
@@ -428,26 +470,17 @@ UINT CFireWallMini1Dlg::CaptureThreadFunc(LPVOID pParam)
 void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* header, const u_char* pkt_data)
 {
 	CFireWallMini1Dlg* pDlg = (CFireWallMini1Dlg*)param;
+
+	//DEBUG_LOG(L">>> Xu ly goi tin dai: %d bytes", header->len);
+
 	if (!pDlg->m_isCapturing) return;
-
-	// --- SỬA LẠI PHẦN LOGGING ---
-	// Tăng biến đếm thành viên (đã được reset khi bấm Start)
-	pDlg->m_debugPacketCount++;
-
-	// Chỉ log 50 gói đầu tiên của phiên chạy hiện tại
-	bool shouldLog = (pDlg->m_debugPacketCount < 50);
-
-	if (shouldLog) {
-		DEBUG_LOG(L"[PACKET #%d] Captured Len: %d", pDlg->m_debugPacketCount, header->len);
-	}
-	// ----------------------------
 
 	// --- KIỂM TRA ĐỘ DÀI GÓI TIN ---
 	// Tránh đọc quá vùng nhớ nếu gói tin quá ngắn
-	if (header->len < 14) return; // Không đủ header Ethernet
+	if (header->len < pDlg->m_linkHeaderLen) return;
 
 	// 1. Parse Ethernet Header (14 bytes)
-	IpHeader* ipHeader = (IpHeader*)(pkt_data + 14);
+	IpHeader* ipHeader = (IpHeader*)(pkt_data + pDlg->m_linkHeaderLen);
 
 	// Kiểm tra version IP (Chỉ xử lý IPv4 - 4 bits đầu tiên là 4)
 	// ipHeader->ver_ihl là 1 byte: VVVV IIII. Lấy 4 bit đầu.
@@ -473,25 +506,51 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 	int protocol = ipHeader->proto;
 	int srcPort = 0, dstPort = 0;
 	CString strProtocol = _T("OTHER");
+	CString strInfo = _T("");
 
 	// 3. Parse Protocol
 	if (protocol == IPPROTO_TCP) {
 		strProtocol = _T("TCP");
-		// Tính toán offset header IP thực tế (vì IHL có thể > 5)
 		int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
-		TcpHeader* tcpHeader = (TcpHeader*)(pkt_data + 14 + ipHeaderLen);
+		TcpHeader* tcpHeader = (TcpHeader*)(pkt_data + pDlg->m_linkHeaderLen + ipHeaderLen);
 		srcPort = ntohs(tcpHeader->sport);
 		dstPort = ntohs(tcpHeader->dport);
+
+		// --- XỬ LÝ INFO TCP (Đọc cờ) ---
+		// Cờ nằm trong byte 'flags'
+		if (tcpHeader->flags & 0x02) strInfo += _T("[SYN] ");
+		if (tcpHeader->flags & 0x10) strInfo += _T("[ACK] ");
+		if (tcpHeader->flags & 0x01) strInfo += _T("[FIN] ");
+		if (tcpHeader->flags & 0x04) strInfo += _T("[RST] ");
+		if (tcpHeader->flags & 0x08) strInfo += _T("[PSH] ");
+
+		// Thêm Seq number cho ngầu (Optional)
+		CString strSeq;
+		strSeq.Format(_T("Seq=%u"), ntohl(tcpHeader->seq));
+		strInfo += strSeq;
 	}
 	else if (protocol == IPPROTO_UDP) {
 		strProtocol = _T("UDP");
 		int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
-		UdpHeader* udpHeader = (UdpHeader*)(pkt_data + 14 + ipHeaderLen);
+		UdpHeader* udpHeader = (UdpHeader*)(pkt_data + pDlg->m_linkHeaderLen + ipHeaderLen);
 		srcPort = ntohs(udpHeader->sport);
 		dstPort = ntohs(udpHeader->dport);
+
+		// --- XỬ LÝ INFO UDP ---
+		strInfo.Format(_T("Len=%d"), ntohs(udpHeader->len));
 	}
 	else if (protocol == IPPROTO_ICMP) {
 		strProtocol = _T("ICMP");
+		int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
+
+		// Ép kiểu sang IcmpHeader
+		IcmpHeader* icmpHeader = (IcmpHeader*)(pkt_data + pDlg->m_linkHeaderLen + ipHeaderLen);
+
+		// --- XỬ LÝ INFO ICMP ---
+		if (icmpHeader->type == 8) strInfo = _T("Echo (Ping) Request");
+		else if (icmpHeader->type == 0) strInfo = _T("Echo (Ping) Reply");
+		else if (icmpHeader->type == 3) strInfo = _T("Destination Unreachable");
+		else strInfo.Format(_T("Type=%d, Code=%d"), icmpHeader->type, icmpHeader->code);
 	}
 
 
@@ -499,23 +558,23 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 	CString matchedRule = _T("");
 	bool isMatch = false;
 
-	if (strProtocol == _T("UDP")) {
-		matchedRule = _T("Rule 1 (All UDP)");
+	if (strProtocol == _T("TCP")) {
+		matchedRule = _T("Rule 1");
 		isMatch = true;
 	}
-	else if (strProtocol == _T("TCP")) {
-		matchedRule = _T("Rule 2 (All TCP)");
+	else if (strProtocol == _T("UDP")) {
+		matchedRule = _T("Rule 2");
 		isMatch = true;
 	}
 	else if (strProtocol == _T("ICMP")) {
-		matchedRule = _T("Rule 3 (ICMP - Ping)");
+		matchedRule = _T("Rule 3");
 		isMatch = true;
 	}
 
 	// 5. Gửi về UI hoặc Log Drop
 	if (isMatch) {
 		// Log MATCH luôn được hiện (vì số lượng ít hơn nhiều so với RAW)
-		DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s | Src: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+		//DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s | Src: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
 
 		LogData* pLog = new LogData;
 
@@ -532,6 +591,8 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 		pLog->srcPort.Format(_T("%d"), srcPort);
 		pLog->dstIP = dstIP;
 		pLog->dstPort.Format(_T("%d"), dstPort);
+		pLog->size.Format(_T("%d"), header->len);
+		pLog->info = strInfo;
 		pLog->matchedRule = matchedRule;
 
 		pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
@@ -546,18 +607,23 @@ LRESULT CFireWallMini1Dlg::OnUpdateLog(WPARAM wParam, LPARAM lParam)
 	if (pLog) {
 		// 1. Insert Log vào List Control
 		int nIndex = m_listLog.GetItemCount();
-		m_listLog.InsertItem(nIndex, pLog->time);
-		m_listLog.SetItemText(nIndex, 1, pLog->protocol);
-		m_listLog.SetItemText(nIndex, 2, pLog->srcIP);
-		m_listLog.SetItemText(nIndex, 3, pLog->srcPort);
-		m_listLog.SetItemText(nIndex, 4, pLog->dstIP);
-		m_listLog.SetItemText(nIndex, 5, pLog->dstPort);
-		m_listLog.SetItemText(nIndex, 6, pLog->matchedRule);
+		CString strNo;
+		strNo.Format(_T("%d"), nIndex + 1);
+		m_listLog.InsertItem(nIndex, strNo);
+		m_listLog.SetItemText(nIndex, 1, pLog->time);       
+		m_listLog.SetItemText(nIndex, 2, pLog->protocol);    
+		m_listLog.SetItemText(nIndex, 3, pLog->srcIP);       
+		m_listLog.SetItemText(nIndex, 4, pLog->srcPort);    
+		m_listLog.SetItemText(nIndex, 5, pLog->dstIP);      
+		m_listLog.SetItemText(nIndex, 6, pLog->dstPort);   
+		m_listLog.SetItemText(nIndex, 7, pLog->size); 
+		m_listLog.SetItemText(nIndex, 8, pLog->info);
+		m_listLog.SetItemText(nIndex, 9, pLog->matchedRule);
 
 		// Auto scroll xuống dưới cùng
 		m_listLog.EnsureVisible(nIndex, FALSE);
 
-		// 2. Cập nhật Counters [cite: 71, 73]
+		// 2. Cập nhật Counters 
 		m_cntTotal++;
 		if (pLog->protocol == _T("TCP")) m_cntTcp++;
 		else if (pLog->protocol == _T("UDP")) m_cntUdp++;
@@ -575,4 +641,51 @@ LRESULT CFireWallMini1Dlg::OnUpdateLog(WPARAM wParam, LPARAM lParam)
 		delete pLog;
 	}
 	return 0;
+}
+
+
+// Custom Draw để tô màu nền từng dòng trong List Control
+void CFireWallMini1Dlg::OnCustomDrawList(NMHDR* pNMHDR, LRESULT* pResult)
+{
+	NMLVCUSTOMDRAW* pLVCD = reinterpret_cast<NMLVCUSTOMDRAW*>(pNMHDR);
+
+	// Mặc định trả về Default để Windows tự vẽ các bước tiếp theo
+	*pResult = CDRF_DODEFAULT;
+
+	// Giai đoạn 1: Chuẩn bị vẽ (Pre-Paint) -> Yêu cầu thông báo khi vẽ từng dòng (Item)
+	if (pLVCD->nmcd.dwDrawStage == CDDS_PREPAINT) {
+		*pResult = CDRF_NOTIFYITEMDRAW;
+	}
+	// Giai đoạn 2: Chuẩn bị vẽ một dòng cụ thể (Item Pre-Paint)
+	else if (pLVCD->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+
+		// Lấy số thứ tự dòng đang vẽ
+		int nRow = (int)pLVCD->nmcd.dwItemSpec;
+
+		// Lấy nội dung cột Protocol (Cột số 2 - Vì cột 0 là No, cột 1 là Time)
+		// Lưu ý: Nếu cột Protocol của bạn ở vị trí khác, hãy sửa số 2
+		CString strProtocol = m_listLog.GetItemText(nRow, 2);
+
+		// --- XỬ LÝ TÔ MÀU NỀN (Background Color) ---
+
+		if (strProtocol.Find(_T("TCP")) != -1) {
+			// Màu Xanh Lá Nhạt (RGB: 220, 255, 220)
+			pLVCD->clrTextBk = RGB(220, 255, 220);
+		}
+		else if (strProtocol.Find(_T("UDP")) != -1) {
+			// Màu Xanh Dương Nhạt (RGB: 220, 240, 255)
+			pLVCD->clrTextBk = RGB(220, 240, 255);
+		}
+		else if (strProtocol.Find(_T("ICMP")) != -1) {
+			// Màu Vàng Nhạt (RGB: 255, 255, 220)
+			pLVCD->clrTextBk = RGB(255, 255, 220);
+		}
+		else {
+			// Màu trắng mặc định cho các loại khác
+			pLVCD->clrTextBk = RGB(255, 255, 255);
+		}
+
+		// Báo cho Windows biết là ta đã đổi font/màu rồi
+		*pResult = CDRF_NEWFONT;
+	}
 }

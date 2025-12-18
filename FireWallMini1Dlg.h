@@ -36,6 +36,7 @@ protected:
 	afx_msg void OnSysCommand(UINT nID, LPARAM lParam);
 	afx_msg void OnPaint();
 	afx_msg HCURSOR OnQueryDragIcon();
+	afx_msg void OnCustomDrawList(NMHDR* pNMHDR, LRESULT* pResult);
 	DECLARE_MESSAGE_MAP()
 
 	// Biến quản lý Npcap
@@ -52,7 +53,7 @@ protected:
 	long m_cntUdp;
 	long m_cntIcmp;
 
-	long m_debugPacketCount;
+	int m_linkHeaderLen; // Độ dài header liên kết (Link Layer)
 
 	// Hàm Worker Thread (static để chạy độc lập)
 	static UINT CaptureThreadFunc(LPVOID pParam);
