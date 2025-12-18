@@ -137,6 +137,7 @@ CFireWallMini1Dlg::CFireWallMini1Dlg(CWnd* pParent /*=nullptr*/)
 	, m_cntTcp(0)
 	, m_cntUdp(0)
 	, m_cntIcmp(0)
+	, m_cntOther(0)
 	, m_linkHeaderLen(0)
 	// ----------------------------------------------------
 {
@@ -153,6 +154,7 @@ void CFireWallMini1Dlg::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_STATIC_TCP, m_strTcp);
 	DDX_Control(pDX, IDC_STATIC_UDP, m_strUdp);
 	DDX_Control(pDX, IDC_STATIC_ICMP, m_strIcmp);
+	DDX_Control(pDX, IDC_STATIC_OTHER, m_strOther);
 	DDX_Control(pDX, IDC_COMBO_ADAPTER, m_cbAdapter);
 	DDX_Control(pDX, IDC_BTN_CLEAR, m_btnClear);
 	DDX_Control(pDX, IDC_STATIC_ROW_COUNT, m_strRowCount);
@@ -419,6 +421,7 @@ void CFireWallMini1Dlg::OnBnClickedBtnClear()
 	m_strTcp.SetWindowText(_T("0"));
 	m_strUdp.SetWindowText(_T("0"));
 	m_strIcmp.SetWindowText(_T("0"));
+	m_strOther.SetWindowText(_T("0"));
 	m_strRowCount.SetWindowText(_T("0"));
 }
 
@@ -556,47 +559,42 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 
 	// 4. Match Rule
 	CString matchedRule = _T("");
-	bool isMatch = false;
 
 	if (strProtocol == _T("TCP")) {
 		matchedRule = _T("Rule 1");
-		isMatch = true;
 	}
 	else if (strProtocol == _T("UDP")) {
 		matchedRule = _T("Rule 2");
-		isMatch = true;
 	}
 	else if (strProtocol == _T("ICMP")) {
 		matchedRule = _T("Rule 3");
-		isMatch = true;
+	}
+	else {
+		matchedRule = _T("Not Matched");
 	}
 
-	// 5. Gửi về UI hoặc Log Drop
-	if (isMatch) {
-		// Log MATCH luôn được hiện (vì số lượng ít hơn nhiều so với RAW)
-		//DEBUG_LOG(L"[MATCH] Rule: %s | Proto: %s | Src: %s", (LPCTSTR)matchedRule, (LPCTSTR)strProtocol, (LPCTSTR)srcIP);
+	// --- GỬI VỀ UI ---
+	// Luôn luôn gửi để đếm thống kê, bất kể là loại gì
+	LogData* pLog = new LogData;
 
-		LogData* pLog = new LogData;
+	// Format Time (Giữ nguyên)
+	time_t local_tv_sec = header->ts.tv_sec;
+	struct tm ltime;
+	localtime_s(&ltime, &local_tv_sec);
+	char timestr[16];
+	strftime(timestr, sizeof timestr, "%H:%M:%S", &ltime);
 
-		// Format Time
-		time_t local_tv_sec = header->ts.tv_sec;
-		struct tm ltime;
-		localtime_s(&ltime, &local_tv_sec);
-		char timestr[16];
-		strftime(timestr, sizeof timestr, "%H:%M:%S", &ltime);
+	pLog->time = CString(timestr);
+	pLog->protocol = strProtocol;
+	pLog->srcIP = srcIP;
+	pLog->srcPort.Format(_T("%d"), srcPort);
+	pLog->dstIP = dstIP;
+	pLog->dstPort.Format(_T("%d"), dstPort);
+	pLog->size.Format(_T("%d"), header->len);
+	pLog->info = strInfo;
+	pLog->matchedRule = matchedRule; // Nếu là OTHER thì cái này rỗng
 
-		pLog->time = CString(timestr);
-		pLog->protocol = strProtocol;
-		pLog->srcIP = srcIP;
-		pLog->srcPort.Format(_T("%d"), srcPort);
-		pLog->dstIP = dstIP;
-		pLog->dstPort.Format(_T("%d"), dstPort);
-		pLog->size.Format(_T("%d"), header->len);
-		pLog->info = strInfo;
-		pLog->matchedRule = matchedRule;
-
-		pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
-	}
+	pDlg->PostMessage(WM_UPDATE_LOG, (WPARAM)pLog, 0);
 
 }
 
@@ -605,37 +603,48 @@ LRESULT CFireWallMini1Dlg::OnUpdateLog(WPARAM wParam, LPARAM lParam)
 {
 	LogData* pLog = (LogData*)wParam;
 	if (pLog) {
-		// 1. Insert Log vào List Control
-		int nIndex = m_listLog.GetItemCount();
-		CString strNo;
-		strNo.Format(_T("%d"), nIndex + 1);
-		m_listLog.InsertItem(nIndex, strNo);
-		m_listLog.SetItemText(nIndex, 1, pLog->time);       
-		m_listLog.SetItemText(nIndex, 2, pLog->protocol);    
-		m_listLog.SetItemText(nIndex, 3, pLog->srcIP);       
-		m_listLog.SetItemText(nIndex, 4, pLog->srcPort);    
-		m_listLog.SetItemText(nIndex, 5, pLog->dstIP);      
-		m_listLog.SetItemText(nIndex, 6, pLog->dstPort);   
-		m_listLog.SetItemText(nIndex, 7, pLog->size); 
-		m_listLog.SetItemText(nIndex, 8, pLog->info);
-		m_listLog.SetItemText(nIndex, 9, pLog->matchedRule);
+		// --- 1. PHẦN THỐNG KÊ (COUNTERS) ---
+		m_cntTotal++; // Tăng tổng số gói bắt được
 
-		// Auto scroll xuống dưới cùng
-		m_listLog.EnsureVisible(nIndex, FALSE);
-
-		// 2. Cập nhật Counters 
-		m_cntTotal++;
 		if (pLog->protocol == _T("TCP")) m_cntTcp++;
 		else if (pLog->protocol == _T("UDP")) m_cntUdp++;
 		else if (pLog->protocol == _T("ICMP")) m_cntIcmp++;
+		else m_cntOther++; // Đếm gói lạ
 
+		// Cập nhật lên Static Text
 		CString strTmp;
 		strTmp.Format(_T("%ld"), m_cntTotal); m_strTotal.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntTcp);   m_strTcp.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntUdp);   m_strUdp.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntIcmp);  m_strIcmp.SetWindowText(strTmp);
+		strTmp.Format(_T("%ld"), m_cntOther); m_strOther.SetWindowText(strTmp); // Cần có biến control này như hướng dẫn trước
 
-		strTmp.Format(_T("%d rows"), nIndex + 1); m_strRowCount.SetWindowText(strTmp);
+		// --- 2. PHẦN LOG (LIST CONTROL) ---
+		// ĐÃ BỎ IF CHECK MATCHED RULE -> GHI LOG TẤT CẢ
+
+		int nIndex = m_listLog.GetItemCount();
+		CString strNo;
+		strNo.Format(_T("%d"), nIndex + 1);
+
+		m_listLog.InsertItem(nIndex, strNo);
+		m_listLog.SetItemText(nIndex, 1, pLog->time);
+		m_listLog.SetItemText(nIndex, 2, pLog->protocol);
+		m_listLog.SetItemText(nIndex, 3, pLog->srcIP);
+		m_listLog.SetItemText(nIndex, 4, pLog->srcPort);
+		m_listLog.SetItemText(nIndex, 5, pLog->dstIP);
+		m_listLog.SetItemText(nIndex, 6, pLog->dstPort);
+		m_listLog.SetItemText(nIndex, 7, pLog->size);
+		m_listLog.SetItemText(nIndex, 8, pLog->info);
+
+		// Cột này sẽ tự động trống nếu pLog->matchedRule là ""
+		m_listLog.SetItemText(nIndex, 9, pLog->matchedRule);
+
+		// Auto scroll
+		m_listLog.EnsureVisible(nIndex, FALSE);
+
+		// Cập nhật số dòng
+		strTmp.Format(_T("%d rows"), nIndex + 1);
+		m_strRowCount.SetWindowText(strTmp);
 
 		// Giải phóng bộ nhớ
 		delete pLog;
@@ -681,8 +690,8 @@ void CFireWallMini1Dlg::OnCustomDrawList(NMHDR* pNMHDR, LRESULT* pResult)
 			pLVCD->clrTextBk = RGB(255, 255, 220);
 		}
 		else {
-			// Màu trắng mặc định cho các loại khác
-			pLVCD->clrTextBk = RGB(255, 255, 255);
+			// Màu xám nhạt cho các loại khác
+			pLVCD->clrTextBk = RGB(230, 230, 230);
 		}
 
 		// Báo cho Windows biết là ta đã đổi font/màu rồi

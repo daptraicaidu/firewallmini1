@@ -52,8 +52,9 @@ protected:
 	long m_cntTcp;
 	long m_cntUdp;
 	long m_cntIcmp;
+	long m_cntOther;
 
-	int m_linkHeaderLen; // Độ dài header liên kết (Link Layer)
+	unsigned int m_linkHeaderLen; // Độ dài header liên kết (Link Layer)
 
 	// Hàm Worker Thread (static để chạy độc lập)
 	static UINT CaptureThreadFunc(LPVOID pParam);
@@ -75,6 +76,7 @@ public:
 	CStatic m_strTcp;
 	CStatic m_strUdp;
 	CStatic m_strIcmp;
+	CStatic m_strOther;
 	CComboBox m_cbAdapter;
 	CButton m_btnClear;
 	CStatic m_strRowCount;
