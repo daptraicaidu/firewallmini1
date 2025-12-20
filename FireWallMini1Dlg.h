@@ -11,6 +11,19 @@ struct pcap;
 typedef struct pcap pcap_t;
 #endif
 
+// Struct dùng để gửi dữ liệu từ Thread về UI
+struct LogData {
+	CString time;
+	CString protocol;
+	CString srcIP;
+	CString srcPort;
+	CString dstIP;
+	CString dstPort;
+	CString size;
+	CString info;
+	CString matchedRule;
+};
+
 // CFireWallMini1Dlg dialog
 class CFireWallMini1Dlg : public CDialogEx
 {
@@ -47,6 +60,9 @@ protected:
 	// Danh sách tên thiết bị (name) tương ứng với ComboBox
 	std::vector<std::string> m_adapterNames;
 
+	std::vector<LogData*> m_allLogs;
+	void ApplyFilters();
+
 	// Các biến đếm thống kê
 	long m_cntTotal;
 	long m_cntTcp;
@@ -68,6 +84,8 @@ protected:
 	// Hàm xóa log (cho nút Clear)
 	afx_msg void OnBnClickedBtnClear();
 
+	afx_msg void OnCbnSelchangeFilter();
+
 public:
 	CListCtrl m_listLog;
 	CButton m_btnStart;
@@ -78,6 +96,8 @@ public:
 	CStatic m_strIcmp;
 	CStatic m_strOther;
 	CComboBox m_cbAdapter;
+	CComboBox m_cbFilterProto; // Control cho Protocol Filter
+	CComboBox m_cbFilterRule;  // Control cho Rule Filter
 	CButton m_btnClear;
 	CStatic m_strRowCount;
 	CStatic m_staticRules;

@@ -69,18 +69,6 @@ struct UdpHeader {
 };
 #pragma pack(pop)
 
-// Struct dùng để gửi dữ liệu từ Thread về UI
-struct LogData {
-	CString time;
-	CString protocol;
-	CString srcIP;
-	CString srcPort;
-	CString dstIP;
-	CString dstPort;
-	CString size;
-	CString info;
-	CString matchedRule;
-};
 
 struct IcmpHeader {
 	unsigned char type; // 8=Request, 0=Reply
@@ -159,6 +147,8 @@ void CFireWallMini1Dlg::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_BTN_CLEAR, m_btnClear);
 	DDX_Control(pDX, IDC_STATIC_ROW_COUNT, m_strRowCount);
 	DDX_Control(pDX, IDC_STATIC_RULES, m_staticRules);
+	DDX_Control(pDX, IDC_COMBO_FILTER_PROTO, m_cbFilterProto);
+	DDX_Control(pDX, IDC_COMBO_FILTER_RULE, m_cbFilterRule);
 }
 
 BEGIN_MESSAGE_MAP(CFireWallMini1Dlg, CDialogEx)
@@ -171,6 +161,9 @@ BEGIN_MESSAGE_MAP(CFireWallMini1Dlg, CDialogEx)
 
 	ON_MESSAGE(WM_UPDATE_LOG, &CFireWallMini1Dlg::OnUpdateLog)
 	ON_NOTIFY(NM_CUSTOMDRAW, IDC_LIST_LOG, &CFireWallMini1Dlg::OnCustomDrawList)
+
+	ON_CBN_SELCHANGE(IDC_COMBO_FILTER_PROTO, &CFireWallMini1Dlg::OnCbnSelchangeFilter)
+	ON_CBN_SELCHANGE(IDC_COMBO_FILTER_RULE, &CFireWallMini1Dlg::OnCbnSelchangeFilter)
 	
 END_MESSAGE_MAP()
 
@@ -244,10 +237,15 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 	m_cbAdapter.SetCurSel(0);
 
 	// Hiển thị danh sách Rule đang kích hoạt
-	CString strRulesContent = 
-		_T("Rule 1: Log mọi gói TCP\n")
-		_T("Rule 2: Log mọi gói UDP\n")
-		_T("Rule 3: Log mọi gói ICMP")
+	CString strRulesContent =
+		_T("Rule 1: Log mọi gói ICMP (Ping)\n")
+		_T("Rule 2: Web Traffic (Port 80, 443)\n")
+		_T("Rule 3: DNS Query (UDP Port 53)\n")
+		_T("Rule 4: Remote Admin (SSH, RDP)\n")
+		_T("Rule 5: Kết nối mới (TCP SYN)\n")
+		_T("Rule 6: Gói tin lớn (> 1KB)\n")
+		_T("Rule 7: Gói UDP nhỏ (< 64 bytes)\n")
+		_T("Rule 8: Các gói còn lại")
 		;
 
 	m_staticRules.SetWindowText(strRulesContent);
@@ -263,8 +261,30 @@ BOOL CFireWallMini1Dlg::OnInitDialog()
 	m_listLog.InsertColumn(6, _T("Dst Port"), LVCFMT_LEFT, 60);
 	m_listLog.InsertColumn(7, _T("Size"), LVCFMT_LEFT, 60);
 	m_listLog.InsertColumn(8, _T("Info"), LVCFMT_LEFT, 200);
-	m_listLog.InsertColumn(9, _T("Matched Rule"), LVCFMT_LEFT, 90);
+	m_listLog.InsertColumn(9, _T("Matched Rule"), LVCFMT_LEFT, 120);
 
+
+	// --- KHỞI TẠO FILTER PROTOCOL ---
+	m_cbFilterProto.AddString(_T("All"));
+	m_cbFilterProto.AddString(_T("TCP"));
+	m_cbFilterProto.AddString(_T("UDP"));
+	m_cbFilterProto.AddString(_T("ICMP"));
+	m_cbFilterProto.AddString(_T("OTHER"));
+	m_cbFilterProto.SetCurSel(0); // Mặc định chọn All
+
+	// --- KHỞI TẠO FILTER RULE ---
+	m_cbFilterRule.AddString(_T("All"));
+	m_cbFilterRule.AddString(_T("Rule 1 (ICMP)"));
+	m_cbFilterRule.AddString(_T("Rule 2 (Web/HTTPS)"));
+	m_cbFilterRule.AddString(_T("Rule 3 (DNS)"));
+	m_cbFilterRule.AddString(_T("Rule 4 (Remote Admin)"));
+	m_cbFilterRule.AddString(_T("Rule 5 (New Conn)"));
+	m_cbFilterRule.AddString(_T("Rule 6 (Large Data)"));
+	m_cbFilterRule.AddString(_T("Rule 7 (Tiny UDP)"));
+	m_cbFilterRule.AddString(_T("Rule 8 (Not Matched)"));
+	m_cbFilterRule.SetCurSel(0); // Mặc định chọn All
+
+	SetWindowText(_T("Firewall Mini"));
 
 	return TRUE;  // return TRUE  unless you set the focus to a control
 }
@@ -414,15 +434,25 @@ void CFireWallMini1Dlg::OnBnClickedBtnStop()
 
 void CFireWallMini1Dlg::OnBnClickedBtnClear()
 {
+	// Xóa hiển thị
 	m_listLog.DeleteAllItems();
-	m_cntTotal = m_cntTcp = m_cntUdp = m_cntIcmp = 0;
 
+	// Reset bộ đếm
+	m_cntTotal = m_cntTcp = m_cntUdp = m_cntIcmp = m_cntOther = 0;
 	m_strTotal.SetWindowText(_T("0"));
 	m_strTcp.SetWindowText(_T("0"));
 	m_strUdp.SetWindowText(_T("0"));
 	m_strIcmp.SetWindowText(_T("0"));
 	m_strOther.SetWindowText(_T("0"));
 	m_strRowCount.SetWindowText(_T("0"));
+
+	// --- XÓA DỮ LIỆU TRONG VECTOR ---
+	for (size_t i = 0; i < m_allLogs.size(); ++i) {
+		if (m_allLogs[i]) {
+			delete m_allLogs[i]; // Giải phóng bộ nhớ heap
+		}
+	}
+	m_allLogs.clear(); // Xóa các phần tử trong vector
 }
 
 
@@ -559,18 +589,39 @@ void CFireWallMini1Dlg::PacketHandler(u_char* param, const struct pcap_pkthdr* h
 
 	// 4. Match Rule
 	CString matchedRule = _T("");
+	int pktSize = header->len;
 
-	if (strProtocol == _T("TCP")) {
-		matchedRule = _T("Rule 1");
+	// Rule 1: ICMP (Ưu tiên cao nhất theo yêu cầu của bạn)
+	if (strProtocol == _T("ICMP")) {
+		matchedRule = _T("Rule 1 (ICMP)");
 	}
-	else if (strProtocol == _T("UDP")) {
-		matchedRule = _T("Rule 2");
+	// Rule 2: Web Traffic (HTTP = 80, HTTPS = 443)
+	else if (strProtocol == _T("TCP") && (srcPort == 80 || dstPort == 80 || srcPort == 443 || dstPort == 443)) {
+		matchedRule = _T("Rule 2 (Web/HTTPS)");
 	}
-	else if (strProtocol == _T("ICMP")) {
-		matchedRule = _T("Rule 3");
+	// Rule 3: DNS Query (UDP Port 53)
+	else if (strProtocol == _T("UDP") && (srcPort == 53 || dstPort == 53)) {
+		matchedRule = _T("Rule 3 (DNS)");
 	}
+	// Rule 4: Remote Admin (SSH=22, Telnet=23, RDP=3389)
+	else if (strProtocol == _T("TCP") && (srcPort == 22 || dstPort == 22 || srcPort == 23 || dstPort == 23 || srcPort == 3389 || dstPort == 3389)) {
+		matchedRule = _T("Rule 4 (Remote Admin)");
+	}
+	// Rule 5: New Connection (TCP SYN Flag) - Dựa vào chuỗi Info đã phân tích ở trên
+	else if (strProtocol == _T("TCP") && strInfo.Find(_T("[SYN]")) != -1) {
+		matchedRule = _T("Rule 5 (New Conn)");
+	}
+	// Rule 6: Gói tin kích thước lớn (> 1024 bytes) - Thường là download/upload data
+	else if (pktSize > 1024) {
+		matchedRule = _T("Rule 6 (Large Data)");
+	}
+	// Rule 7: Gói UDP nhỏ (< 64 bytes) - Thường là gói tin rác hoặc keep-alive
+	else if (strProtocol == _T("UDP") && pktSize < 64) {
+		matchedRule = _T("Rule 7 (Tiny UDP)");
+	}
+	// Rule 8: Các trường hợp còn lại
 	else {
-		matchedRule = _T("Not Matched");
+		matchedRule = _T("Rule 8 (Not Matched)");
 	}
 
 	// --- GỬI VỀ UI ---
@@ -603,53 +654,141 @@ LRESULT CFireWallMini1Dlg::OnUpdateLog(WPARAM wParam, LPARAM lParam)
 {
 	LogData* pLog = (LogData*)wParam;
 	if (pLog) {
-		// --- 1. PHẦN THỐNG KÊ (COUNTERS) ---
-		m_cntTotal++; // Tăng tổng số gói bắt được
-
+		// --- 1. PHẦN THỐNG KÊ (Giữ nguyên logic cũ) ---
+		m_cntTotal++;
 		if (pLog->protocol == _T("TCP")) m_cntTcp++;
 		else if (pLog->protocol == _T("UDP")) m_cntUdp++;
 		else if (pLog->protocol == _T("ICMP")) m_cntIcmp++;
-		else m_cntOther++; // Đếm gói lạ
+		else m_cntOther++;
 
-		// Cập nhật lên Static Text
 		CString strTmp;
 		strTmp.Format(_T("%ld"), m_cntTotal); m_strTotal.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntTcp);   m_strTcp.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntUdp);   m_strUdp.SetWindowText(strTmp);
 		strTmp.Format(_T("%ld"), m_cntIcmp);  m_strIcmp.SetWindowText(strTmp);
-		strTmp.Format(_T("%ld"), m_cntOther); m_strOther.SetWindowText(strTmp); // Cần có biến control này như hướng dẫn trước
+		strTmp.Format(_T("%ld"), m_cntOther); m_strOther.SetWindowText(strTmp);
 
-		// --- 2. PHẦN LOG (LIST CONTROL) ---
-		// ĐÃ BỎ IF CHECK MATCHED RULE -> GHI LOG TẤT CẢ
+		// --- 2. LƯU VÀO KHO (QUAN TRỌNG) ---
+		// Chúng ta lưu con trỏ pLog vào vector. 
+		// LƯU Ý: Không được delete pLog ở cuối hàm này nữa!
+		m_allLogs.push_back(pLog);
 
-		int nIndex = m_listLog.GetItemCount();
-		CString strNo;
-		strNo.Format(_T("%d"), nIndex + 1);
+		// --- 3. KIỂM TRA FILTER HIỆN TẠI ĐỂ QUYẾT ĐỊNH CÓ HIỂN THỊ KHÔNG ---
+		CString strFilterProto, strFilterRule;
+		int nIndexProto = m_cbFilterProto.GetCurSel();
+		int nIndexRule = m_cbFilterRule.GetCurSel();
 
-		m_listLog.InsertItem(nIndex, strNo);
-		m_listLog.SetItemText(nIndex, 1, pLog->time);
-		m_listLog.SetItemText(nIndex, 2, pLog->protocol);
-		m_listLog.SetItemText(nIndex, 3, pLog->srcIP);
-		m_listLog.SetItemText(nIndex, 4, pLog->srcPort);
-		m_listLog.SetItemText(nIndex, 5, pLog->dstIP);
-		m_listLog.SetItemText(nIndex, 6, pLog->dstPort);
-		m_listLog.SetItemText(nIndex, 7, pLog->size);
-		m_listLog.SetItemText(nIndex, 8, pLog->info);
+		// Lấy text hiện tại của Combo Box
+		if (nIndexProto != CB_ERR) m_cbFilterProto.GetLBText(nIndexProto, strFilterProto);
+		else strFilterProto = _T("All");
 
-		// Cột này sẽ tự động trống nếu pLog->matchedRule là ""
-		m_listLog.SetItemText(nIndex, 9, pLog->matchedRule);
+		if (nIndexRule != CB_ERR) m_cbFilterRule.GetLBText(nIndexRule, strFilterRule);
+		else strFilterRule = _T("All");
 
-		// Auto scroll
-		m_listLog.EnsureVisible(nIndex, FALSE);
+		// Kiểm tra điều kiện
+		bool matchProto = (strFilterProto == _T("All")) || (pLog->protocol == strFilterProto);
+		bool matchRule = (strFilterRule == _T("All")) || (pLog->matchedRule == strFilterRule);
 
-		// Cập nhật số dòng
-		strTmp.Format(_T("%d rows"), nIndex + 1);
-		m_strRowCount.SetWindowText(strTmp);
+		if (matchProto && matchRule)
+		{
+			int nIndex = m_listLog.GetItemCount();
+			CString strNo;
+			strNo.Format(_T("%d"), nIndex + 1);
 
-		// Giải phóng bộ nhớ
-		delete pLog;
+			m_listLog.InsertItem(nIndex, strNo);
+			m_listLog.SetItemText(nIndex, 1, pLog->time);
+			m_listLog.SetItemText(nIndex, 2, pLog->protocol);
+			m_listLog.SetItemText(nIndex, 3, pLog->srcIP);
+			m_listLog.SetItemText(nIndex, 4, pLog->srcPort);
+			m_listLog.SetItemText(nIndex, 5, pLog->dstIP);
+			m_listLog.SetItemText(nIndex, 6, pLog->dstPort);
+			m_listLog.SetItemText(nIndex, 7, pLog->size);
+			m_listLog.SetItemText(nIndex, 8, pLog->info);
+			m_listLog.SetItemText(nIndex, 9, pLog->matchedRule);
+
+			// Auto scroll
+			m_listLog.EnsureVisible(nIndex, FALSE);
+
+			// Cập nhật số dòng hiển thị
+			strTmp.Format(_T("%d rows"), nIndex + 1);
+			m_strRowCount.SetWindowText(strTmp);
+		}
+
+		// QUAN TRỌNG: Đã bỏ dòng "delete pLog;" ở đây vì nó đã được lưu trong m_allLogs
 	}
 	return 0;
+}
+
+
+void CFireWallMini1Dlg::ApplyFilters()
+{
+	// 1. Tạm dừng vẽ để tránh giật màn hình
+	m_listLog.SetRedraw(FALSE);
+
+	// 2. Xóa toàn bộ hiển thị trên List Control (nhưng KHÔNG xóa dữ liệu trong m_allLogs)
+	m_listLog.DeleteAllItems();
+
+	// 3. Lấy giá trị đang chọn trong Combo Box
+	CString strFilterProto, strFilterRule;
+	int nIndexProto = m_cbFilterProto.GetCurSel();
+	int nIndexRule = m_cbFilterRule.GetCurSel();
+
+	if (nIndexProto != CB_ERR) m_cbFilterProto.GetLBText(nIndexProto, strFilterProto);
+	if (nIndexRule != CB_ERR) m_cbFilterRule.GetLBText(nIndexRule, strFilterRule);
+
+	// 4. Duyệt qua kho lưu trữ m_allLogs để lọc
+	int displayIndex = 0;
+	for (size_t i = 0; i < m_allLogs.size(); ++i)
+	{
+		LogData* pLog = m_allLogs[i];
+		if (!pLog) continue;
+
+		// --- ĐIỀU KIỆN LỌC ---
+		bool matchProto = (strFilterProto == _T("All")) || (pLog->protocol == strFilterProto);
+
+		// Lưu ý: Đối với Rule, cần cẩn thận vì text log có thể dài hơn, nhưng ở đây ta so sánh bằng chuỗi định sẵn
+		bool matchRule = (strFilterRule == _T("All")) || (pLog->matchedRule == strFilterRule);
+
+		// Nếu thỏa mãn CẢ HAI (AND)
+		if (matchProto && matchRule)
+		{
+			CString strNo;
+			strNo.Format(_T("%d"), displayIndex + 1);
+
+			m_listLog.InsertItem(displayIndex, strNo);
+			m_listLog.SetItemText(displayIndex, 1, pLog->time);
+			m_listLog.SetItemText(displayIndex, 2, pLog->protocol);
+			m_listLog.SetItemText(displayIndex, 3, pLog->srcIP);
+			m_listLog.SetItemText(displayIndex, 4, pLog->srcPort);
+			m_listLog.SetItemText(displayIndex, 5, pLog->dstIP);
+			m_listLog.SetItemText(displayIndex, 6, pLog->dstPort);
+			m_listLog.SetItemText(displayIndex, 7, pLog->size);
+			m_listLog.SetItemText(displayIndex, 8, pLog->info);
+			m_listLog.SetItemText(displayIndex, 9, pLog->matchedRule);
+
+			// Set Item Data là index trong vector gốc để sau này có cần truy xuất ngược (Optional)
+			m_listLog.SetItemData(displayIndex, (DWORD_PTR)pLog);
+
+			displayIndex++;
+		}
+	}
+
+	// 5. Cập nhật lại số dòng hiển thị
+	CString strTmp;
+	strTmp.Format(_T("%d rows"), displayIndex);
+	m_strRowCount.SetWindowText(strTmp);
+
+	// 6. Cho phép vẽ lại
+	m_listLog.SetRedraw(TRUE);
+
+	// Scroll xuống dưới cùng nếu muốn
+	if (displayIndex > 0) m_listLog.EnsureVisible(displayIndex - 1, FALSE);
+}
+
+// Sự kiện khi chọn Combo Box
+void CFireWallMini1Dlg::OnCbnSelchangeFilter()
+{
+	ApplyFilters();
 }
 
 
